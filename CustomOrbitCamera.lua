@@ -1,3 +1,12 @@
+--[[ 
+
+--NOTE: Used UIS for custom input controls instead of CAS, I can use CAS if later 
+i want rebindable controls and mobile freidnly version but as of now i dont see any need
+
+
+]]
+
+
 local Data = script.Parent.Parent.Data
 local Campos = require(Data.CameraPos)
 local PlanetData = require(Data.PlanetData)
