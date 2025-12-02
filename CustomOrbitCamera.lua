@@ -4,327 +4,280 @@ local PlanetData = require(Data.PlanetData)
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 
--- table stores renderstep connections for each player so we can disconnect and cleanup later
+-- tuning values for camera behavior
+local TWEEN_DURATION = 3
+local TOP_VIEW_HEIGHT = 2000
+local ZOOM_SENSITIVITY = 50
+local ORBIT_ROTATION_SPEED = 0.005
+local MIN_DISTANCE_THRESHOLD = 1
+local MIN_ELEVATION_CLAMP = -math.pi / 2 + 0.1
+local MAX_ELEVATION_CLAMP = math.pi / 2 - 0.1
+
+-- tracks active renderstep loops per player id
 local cameraConnections = {}
--- table stores camera state data (angles, distance, zoom limits) for smooth orbit controls
+-- stores orbit state (angles, distance, zoom bounds) indexed by userid
 local cameraStates = {}
 
-local Functions = {
+local Functions = {}
 
-	HideZones = function()
-		local TS = game:GetService("TweenService")
-		local info  = TweenInfo.new(3,Enum.EasingStyle.Quad,Enum.EasingDirection.In)
-		local OutGoal = {Transparency = 1}
+-- looks for planet in either instance form or by name string
+local function resolvePlanet(planetRef)
+	if typeof(planetRef) == "Instance" then
+		return planetRef
+	elseif typeof(planetRef) == "string" then
+		local planetsFolder = workspace:FindFirstChild("Planets")
+		local testFolder = workspace:FindFirstChild("TestingPlanets")
+		return (planetsFolder and planetsFolder:FindFirstChild(planetRef)) or (testFolder and testFolder:FindFirstChild(planetRef))
+	end
+	return nil
+end
 
-		local RingFolder = workspace:WaitForChild("Habitibility")
+-- makes sure planet exists and has the ghost orbit point
+local function validatePlanet(planet)
+	if not planet or not planet:FindFirstChild("Ghost") then
+		return false
+	end
+	local ghost = planet:FindFirstChild("Ghost")
+	return ghost and ghost:IsA("BasePart")
+end
 
-		local function TweenOut(Ring)
-			local TweenOut = TS:Create(Ring,info,OutGoal)
-			TweenOut:Play()
-		end
-		for i,v in RingFolder:GetChildren() do
-			if v:IsA("UnionOperation") or v:IsA("Part") then
-				TweenOut(v)
-			end
-		end
-	end,
+-- wipes camera state and disconnects any running loops for given player
+local function clearPlayerCamera(player)
+	local userId = player.UserId
 
-	Showzones = function()
-		local TS = game:GetService("TweenService")
-		local info  = TweenInfo.new(3,Enum.EasingStyle.Quad,Enum.EasingDirection.In)
-		local InGoal = {Transparency = 0.5}
+	if cameraConnections[userId] then
+		cameraConnections[userId]:Disconnect()
+		cameraConnections[userId] = nil
+	end
 
-		local RingFolder = workspace:WaitForChild("Habitibility")
+	if cameraStates[userId] then
+		cameraStates[userId] = nil
+	end
 
-		local function TweenIn(Ring)
-			local TweenIn = TS:Create(Ring,info,InGoal)
-			TweenIn:Play()
-		end
-		for i,v in RingFolder:GetChildren() do
-			if v:IsA("UnionOperation") or v:IsA("Part") then
-				TweenIn(v)
-			end
-		end
-	end,
+	local playerData = player:FindFirstChild("PlayerData")
+	if playerData and playerData:FindFirstChild("LockedOn") then
+		playerData.LockedOn.Value = ""
+	end
+end
 
-	SwitchToTopView = function(Camera:Camera, Player:Player)
-		local SunPart = workspace:WaitForChild("Sun"):WaitForChild("SunPart")
+-- switches camera to manual control mode
+local function setupScriptableCamera(camera)
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.CameraSubject = nil
+end
 
-		local userId = Player.UserId
+-- smooth easing curve, faster start/end than linear
+local function quinticEase(alpha)
+	if alpha < 0.5 then
+		return 16 * alpha * alpha * alpha * alpha * alpha
+	else
+		return 1 - math.pow(-2 * alpha + 2, 5) / 2
+	end
+end
 
-		-- disconnect any active camera orbit loop from previous lock state
-		if cameraConnections[userId] then
-			cameraConnections[userId]:Disconnect()
-			cameraConnections[userId] = nil
-		end
+-- positions camera based on spherical cords (azimuth, elevation, distance from subject)
+local function updateOrbitPosition(camera, subject, azimuth, elevation, distance)
+	if not subject or not subject.Parent then
+		return false
+	end
 
-		-- clear camera state data to prevent orbit math from interfering during tween
-		if cameraStates[userId] then
-			cameraStates[userId] = nil
-		end
+	local relativePos = CFrame.fromEulerAnglesYXZ(elevation, azimuth, 0) * Vector3.new(0, 0, -distance)
+	local newCameraPos = subject.Position + relativePos
+	camera.CFrame = CFrame.new(newCameraPos, subject.Position)
+	return true
+end
 
-		-- update ui to show camera is no longer locked on a planet
-		if Player:FindFirstChild("PlayerData") and Player.PlayerData:FindFirstChild("LockedOn") then
-			Player.PlayerData.LockedOn.Value = ""
-		end
+-- converts camera world position back to orbit angles so we can smoothly continue orbiting
+local function calculateOrbitAngles(cameraPos, subject)
+	local relativePos = cameraPos - subject.Position
+	local distance = relativePos.Magnitude
 
-		-- switch to scriptable mode for full manual camera control during tween
-		Camera.CameraType = Enum.CameraType.Scriptable
-		Camera.CameraSubject = nil
+	if distance < MIN_DISTANCE_THRESHOLD then
+		return 0, math.pi / 2
+	end
 
-		-- wait one renderstep to let camera settle before capturing start position
-		local settleConn
-		settleConn = RunService.RenderStepped:Connect(function()
-			settleConn:Disconnect()
+	local azimuth = math.atan2(relativePos.X, relativePos.Z)
+	local elevation = math.asin(math.clamp(relativePos.Y / distance, -1, 1))
+	return azimuth, elevation
+end
 
-			-- capture settled camera position as tween start point
-			local startCFrame = Camera.CFrame
+-- sets up orbit loop after tween finishes, enables mouse controls
+local function beginOrbit(player, camera, subject, radiusData)
+	local userId = player.UserId
 
-			local tweenDuration = 3
-			local elapsedTime = 0
+	local distance = (camera.CFrame.Position - subject.Position).Magnitude
+	local azimuth, elevation = calculateOrbitAngles(camera.CFrame.Position, subject)
 
-			-- target position is directly above sun
-			local sunHeight = 2000
-			local topDownPos = SunPart.Position + Vector3.new(0, sunHeight, 0)
+	cameraStates[userId] = {
+		subject = subject,
+		distance = distance,
+		minDistance = radiusData.min,
+		maxDistance = radiusData.max,
+		azimuth = azimuth,
+		elevation = elevation,
+	}
 
-			local tweenConn
-			tweenConn = RunService.RenderStepped:Connect(function()
-				if SunPart and SunPart.Parent then
-					elapsedTime = elapsedTime + RunService.RenderStepped:Wait()
-					-- alpha goes from 0 to 1 over tweenduration
-					local alpha = math.min(elapsedTime / tweenDuration, 1)
-
-					-- quintic easing provides smooth acceleration/deceleration curve
-					local easedAlpha = alpha < 0.5 
-						and 16 * alpha * alpha * alpha * alpha * alpha
-						or 1 - math.pow(-2 * alpha + 2, 5) / 2
-
-					-- lerp camera position smoothly from current to topdown
-					local newPos = startCFrame.Position:Lerp(topDownPos, easedAlpha)
-					Camera.CFrame = CFrame.new(newPos, SunPart.Position)
-
-					-- when tween finishes, switch to orbit mode
-					if alpha >= 1 then
-						tweenConn:Disconnect()
-
-						-- measure distance to sun for orbit radius
-						local lockedDistance = (Camera.CFrame.Position - SunPart.Position).Magnitude
-
-						-- initialize orbit state with azimuth/elevation angles and zoom bounds
-						cameraStates[userId] = {
-							subject = SunPart,
-							distance = lockedDistance,
-							minDistance = lockedDistance * 0.5,
-							maxDistance = lockedDistance * 3,
-							azimuth = 0,  -- horizontal rotation angle
-							elevation = math.pi / 2,  -- vertical angle, pi/2 is looking down from top
-						}
-
-						-- renderstep loop updates camera position based on stored angles and distance
-						local orbitConn
-						orbitConn = RunService.RenderStepped:Connect(function()
-							if SunPart and SunPart.Parent and cameraStates[userId] then
-								local state = cameraStates[userId]
-
-								-- convert euler angles to 3d position offset from subject
-								local relativePos = CFrame.fromEulerAnglesYXZ(state.elevation, state.azimuth, 0) * Vector3.new(0, 0, -state.distance)
-								local newCameraPos = state.subject.Position + relativePos
-
-								-- apply calculated position looking at subject
-								Camera.CFrame = CFrame.new(newCameraPos, state.subject.Position)
-							else
-								if orbitConn then
-									orbitConn:Disconnect()
-								end
-								-- cleanup if sun deleted
-								Functions.UnlockCamera(Player)
-							end
-						end)
-
-						cameraConnections[userId] = orbitConn
-					end
-				else
-					tweenConn:Disconnect()
-				end
-			end)
-		end)
-	end,
-
-	UnlockCamera = function(Player)
-		local userId = Player.UserId
-
-		-- stop orbit renderstep loop
-		if cameraConnections[userId] then
-			cameraConnections[userId]:Disconnect()
-			cameraConnections[userId] = nil
-		end
-
-		-- remove stored camera angles and distance data
-		if cameraStates[userId] then
-			cameraStates[userId] = nil
-		end
-
-		-- clear ui locked state indicator
-		if Player:FindFirstChild("PlayerData") and Player.PlayerData:FindFirstChild("LockedOn") then
-			Player.PlayerData.LockedOn.Value = ""
-		end
-	end,
-
-	LockCamera = function(Player, Camera, Planetstr)
-		-- resolve planet reference from either instance or string name
-		local Planet
-		if typeof(Planetstr) == "Instance" then
-			Planet = Planetstr
-		elseif typeof(Planetstr) == "string" then
-			Planet = workspace:FindFirstChild("Planets"):FindFirstChild(Planetstr) 
-				or workspace:FindFirstChild("TestingPlanets"):FindFirstChild(Planetstr)
-		end
-
-		if not Planet or not Planet:FindFirstChild("Ghost") then
+	local orbitConn
+	orbitConn = RunService.RenderStepped:Connect(function()
+		if not subject or not subject.Parent or not cameraStates[userId] then
+			orbitConn:Disconnect()
+			clearPlayerCamera(player)
 			return
 		end
 
-		-- ghost is invisible orbit center part
-		local Ghost = Planet:FindFirstChild("Ghost")
-		if not Ghost or not Ghost:IsA("BasePart") then
+		local state = cameraStates[userId]
+		updateOrbitPosition(camera, state.subject, state.azimuth, state.elevation, state.distance)
+	end)
+
+	cameraConnections[userId] = orbitConn
+end
+
+-- animates camera from current pos to topdown sun view over 3 seconds
+local function tweenToTopView(player, camera, sunPart)
+	local userId = player.UserId
+	setupScriptableCamera(camera)
+
+	local startCFrame = camera.CFrame
+	local targetPos = sunPart.Position + Vector3.new(0, TOP_VIEW_HEIGHT, 0)
+	local elapsedTime = 0
+
+	local tweenConn
+	tweenConn = RunService.RenderStepped:Connect(function(dt)
+		elapsedTime += dt
+		local alpha = math.min(elapsedTime / TWEEN_DURATION, 1)
+
+		if not sunPart or not sunPart.Parent then
+			tweenConn:Disconnect()
 			return
 		end
 
-		local userId = Player.UserId
+		local easedAlpha = quinticEase(alpha)
+		local newPos = startCFrame.Position:Lerp(targetPos, easedAlpha)
+		camera.CFrame = CFrame.new(newPos, sunPart.Position)
 
-		-- disconnect previous camera state before locking to new planet
-		if cameraConnections[userId] then
-			cameraConnections[userId]:Disconnect()
-			cameraConnections[userId] = nil
+		if alpha >= 1 then
+			tweenConn:Disconnect()
+			local lockedDist = (camera.CFrame.Position - sunPart.Position).Magnitude
+			beginOrbit(player, camera, sunPart, {
+				min = lockedDist * 0.5,
+				max = lockedDist * 3,
+			})
+		end
+	end)
+end
+
+-- smoothly flies camera toward planet while it orbits then switches to orbit mode
+local function tweenToPlanet(player, camera, ghost, radiusData)
+	local userId = player.UserId
+	setupScriptableCamera(camera)
+
+	local startCFrame = camera.CFrame
+	local surfaceDistance = radiusData.surface
+	local elapsedTime = 0
+	local tweenFinished = false
+
+	local planet = ghost.Parent
+
+	local tweenConn
+	tweenConn = RunService.RenderStepped:Connect(function(dt)
+		if not planet or not planet.Parent or not ghost or not ghost.Parent then
+			tweenConn:Disconnect()
+			clearPlayerCamera(player)
+			return
 		end
 
-		if cameraStates[userId] then
-			cameraStates[userId] = nil
+		elapsedTime += dt
+		local alpha = math.min(elapsedTime / TWEEN_DURATION, 1)
+
+		if not tweenFinished then
+			local directionVector = camera.CFrame.Position - ghost.Position
+			local distance = directionVector.Magnitude
+
+			-- if camera ends up on top of planet, pick a sensible direction to orbit from
+			local offsetDir = distance < MIN_DISTANCE_THRESHOLD and Vector3.new(0, 0, -1) or directionVector.Unit
+			local targetPos = ghost.Position + offsetDir * surfaceDistance
+
+			local easedAlpha = quinticEase(alpha)
+			local newCameraPos = startCFrame.Position:Lerp(targetPos, easedAlpha)
+			camera.CFrame = CFrame.new(newCameraPos, ghost.Position)
 		end
 
-		if Player:FindFirstChild("PlayerData") and Player.PlayerData:FindFirstChild("LockedOn") then
-			Player.PlayerData.LockedOn.Value = ""
+		if alpha >= 1 and not tweenFinished then
+			tweenFinished = true
+			tweenConn:Disconnect()
+			beginOrbit(player, camera, ghost, radiusData)
 		end
+	end)
+end
 
-		-- update ui to show which planet is currently locked
-		Player.PlayerData.LockedOn.Value = Planet.Name
+-- fade out zone rings
+function Functions.HideZones()
+	local TS = game:GetService("TweenService")
+	local info = TweenInfo.new(3, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	local outGoal = {Transparency = 1}
 
-		-- retrieve planet size from data table to scale camera distance
-		local Radius = PlanetData[tostring(Planetstr)].Size.X / 2
+	local ringFolder = workspace:WaitForChild("Habitibility")
 
-		-- offset scales with planet radius so camera distance matches planet size
-		local CAMERA_OFFSET = math.max(10, Radius * 0.5)
-		local surfaceDistance = Radius + CAMERA_OFFSET
+	for _, v in ringFolder:GetChildren() do
+		if v:IsA("UnionOperation") or v:IsA("Part") then
+			local tween = TS:Create(v, info, outGoal)
+			tween:Play()
+		end
+	end
+end
 
-		-- switch to scriptable for manual camera control during tween
-		Camera.CameraType = Enum.CameraType.Scriptable
-		Camera.CameraSubject = nil
+-- fade in zone rngs
+function Functions.Showzones()
+	local TS = game:GetService("TweenService")
+	local info = TweenInfo.new(3, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	local inGoal = {Transparency = 0.5}
 
-		-- record current camera position before starting tween animation
-		local startCFrame = Camera.CFrame
+	local ringFolder = workspace:WaitForChild("Habitibility")
 
-		local tweenDuration = 3
-		local elapsedTime = 0
-		local tweenFinished = false
+	for _, v in ringFolder:GetChildren() do
+		if v:IsA("UnionOperation") or v:IsA("Part") then
+			local tween = TS:Create(v, info, inGoal)
+			tween:Play()
+		end
+	end
+end
 
-		local tweenConn
-		tweenConn = RunService.RenderStepped:Connect(function()
-			if Planet and Planet.Parent and Ghost and Ghost.Parent then
-				elapsedTime = elapsedTime + RunService.RenderStepped:Wait()
+-- pan to topdown sun view
+function Functions.SwitchToTopView(camera, player)
+	local sunPart = workspace:WaitForChild("Sun"):WaitForChild("SunPart")
 
-				-- alpha represents tween progress from 0 to 1
-				local alpha = math.min(elapsedTime / tweenDuration, 1)
+	clearPlayerCamera(player)
+	tweenToTopView(player, camera, sunPart)
+end
 
-				-- only update camera position during tween phase
-				if not tweenFinished then
-					-- calculate direction from camera toward planet surface point
-					local directionVector = Camera.CFrame.Position - Ghost.Position
-					local distance = directionVector.Magnitude
+-- stop following whatevers locked
+function Functions.UnlockCamera(player)
+	clearPlayerCamera(player)
+end
 
-					-- handle edge case where camera is extremely close to subject
-					local currentOffsetDirection
-					if distance < 1 then
-						currentOffsetDirection = Vector3.new(0, 0, -1)
-					else
-						currentOffsetDirection = directionVector.Unit
-					end
+-- fly camera toward a specific planet and lock orbit to it
+function Functions.LockCamera(player, camera, planetRef)
+	local planet = resolvePlanet(planetRef)
+	if not validatePlanet(planet) then
+		return
+	end
 
-					-- target adjusts every frame to follow orbiting planet
-					local targetPosition = Ghost.Position + currentOffsetDirection * surfaceDistance
+	local ghost = planet:FindFirstChild("Ghost")
+	clearPlayerCamera(player)
 
-					-- quintic easing for smooth motion curve
-					local easedAlpha = alpha < 0.5 
-						and 16 * alpha * alpha * alpha * alpha * alpha
-						or 1 - math.pow(-2 * alpha + 2, 5) / 2
+	player.PlayerData.LockedOn.Value = planet.Name
 
-					-- interpolate from start position toward target
-					local newCameraPos = startCFrame.Position:Lerp(targetPosition, easedAlpha)
-					Camera.CFrame = CFrame.new(newCameraPos, Ghost.Position)
-				end
+	local radius = PlanetData[tostring(planetRef)].Size.X / 2
+	local cameraOffset = math.max(10, radius * 0.5)
 
-				-- after tween completes, switch to orbit control mode
-				if alpha >= 1 and not tweenFinished then
-					tweenFinished = true
-					tweenConn:Disconnect()
+	tweenToPlanet(player, camera, ghost, {
+		surface = radius + cameraOffset,
+		min = radius + (radius * 0.2),
+		max = radius + (radius * 4),
+	})
+end
 
-					-- calculate azimuth and elevation angles from final camera position
-					local relativePos = Camera.CFrame.Position - Ghost.Position
-					local distance = relativePos.Magnitude
-
-					local azimuth = 0
-					local elevation = math.pi / 2
-
-					-- derive angles from position vectors for accurate starting point
-					if distance > 0.1 then
-						azimuth = math.atan2(relativePos.X, relativePos.Z)
-						elevation = math.asin(math.clamp(relativePos.Y / distance, -1, 1))
-					end
-
-					-- store state for orbit loop, zoom limits scale with planet size
-					cameraStates[userId] = {
-						subject = Ghost,
-						distance = distance,
-						minDistance = Radius + (Radius * 0.2),
-						maxDistance = Radius + (Radius * 4),
-						azimuth = azimuth,
-						elevation = elevation,
-					}
-
-					-- renderstep loop maintains camera orbit based on stored angles/distance
-					local orbitConn
-					orbitConn = RunService.RenderStepped:Connect(function()
-						if Planet and Planet.Parent and Ghost and Ghost.Parent and cameraStates[userId] then
-							local state = cameraStates[userId]
-
-							-- spherical coords: convert angles + distance into world position
-							local relativePos = CFrame.fromEulerAnglesYXZ(state.elevation, state.azimuth, 0) * Vector3.new(0, 0, -state.distance)
-							local newCameraPos = state.subject.Position + relativePos
-
-							-- update camera while looking at planet center
-							Camera.CFrame = CFrame.new(newCameraPos, state.subject.Position)
-						else
-							if orbitConn then
-								orbitConn:Disconnect()
-							end
-							-- cleanup if planet removed
-							Functions.UnlockCamera(Player)
-						end
-					end)
-
-					cameraConnections[userId] = orbitConn
-				end
-			else
-				-- planet no longer exists, stop tween
-				if tweenConn then
-					tweenConn:Disconnect()
-				end
-				Functions.UnlockCamera(Player)
-			end
-		end)
-	end,
-}
-
--- listen for mouse input to rotate and zoom camera during orbit
+-- rightclick drag to rotate, scroll to zoom
 UserInputService.InputChanged:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
 
@@ -333,39 +286,28 @@ UserInputService.InputChanged:Connect(function(input, gameProcessed)
 	if not player then return end
 
 	local userId = player.UserId
-	if not cameraStates[userId] then return end
-
 	local state = cameraStates[userId]
+	if not state then return end
 
-	-- right click drag rotates camera around subject
 	if input.UserInputType == Enum.UserInputType.MouseMovement then
 		if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-			-- calculate mouse movement delta
 			local mouseDelta = input.Position - (state.lastMousePos or input.Position)
-
-			-- adjust azimuth and elevation based on mouse movement sensitivity
-			state.azimuth = state.azimuth - (mouseDelta.X * 0.005)  -- x movement changes horizontal angle
-			state.elevation = math.clamp(state.elevation + (mouseDelta.Y * 0.005), -math.pi / 2 + 0.1, math.pi / 2 - 0.1)  -- y movement changes vertical angle, clamped to prevent flipping
+			state.azimuth -= mouseDelta.X * ORBIT_ROTATION_SPEED
+			state.elevation = math.clamp(state.elevation + mouseDelta.Y * ORBIT_ROTATION_SPEED, MIN_ELEVATION_CLAMP, MAX_ELEVATION_CLAMP)
 		end
 		state.lastMousePos = input.Position
 	end
 
-	-- scroll wheel zooms in and out while maintaining orbit angles
 	if input.UserInputType == Enum.UserInputType.MouseWheel then
 		local scrollDelta = input.Position.Z
-		local zoomSensitivity = 50
-
-		-- adjust distance inversely to scroll direction
-		state.distance = state.distance - (scrollDelta * zoomSensitivity)
-
-		-- enforce min/max zoom bounds
+		state.distance -= scrollDelta * ZOOM_SENSITIVITY
 		state.distance = math.max(state.minDistance, math.min(state.distance, state.maxDistance))
 	end
 end)
 
--- cleanup camera state when player leaves game to prevent memory leaks
-game.Players.PlayerRemoving:Connect(function(Player)
-	Functions.UnlockCamera(Player)
+-- cleanp on player disconnect
+game.Players.PlayerRemoving:Connect(function(player)
+	Functions.UnlockCamera(player)
 end)
 
 return Functions
